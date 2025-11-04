@@ -35,7 +35,7 @@ NOTIFY_CHARACTERISTIC_UUIDS   = ["0000ff02-0000-1000-8000-00805f9b34fb"]
 INITIAL_PACKET                = bytearray.fromhex("00 01 80 00 00 04 05 0a 81 8a 8b 96")
 GET_LED_SETTINGS_PACKET       = bytearray.fromhex("00 02 80 00 00 05 06 0a 63 12 21 f0 86")
 DEFAULT_ATTEMPTS              = 3
-BLEAK_BACKOFF_TIME            = 0.25
+BLEAK_BACKOFF_TIME            = 3
 RETRY_BACKOFF_EXCEPTIONS      = (BleakDBusError)
 SUPPORTED_MODELS              = {}
 
@@ -206,11 +206,16 @@ class LEDNETWFInstance:
         # Send initial packets to device to see if it sends notifications
         LOGGER.debug("Send initial packets")
         await self._write(self._model_interface.INITIAL_PACKET)
-        if not self._model_interface.chip_type:
-            # We should only need to get this once, since config is immutable.
-            # All future changes of this data will come via the config flow.
-            LOGGER.debug(f"Sending GET_LED_SETTINGS_PACKET to {self.bluetooth_device_name}")
-            await self._write(self._model_interface.GET_LED_SETTINGS_PACKET)
+        # if not self._model_interface.chip_type:
+        #     # We should only need to get this once, since config is immutable.
+        #     # All future changes of this data will come via the config flow.
+        #     LOGGER.debug(f"Sending GET_LED_SETTINGS_PACKET to {self.bluetooth_device_name}")
+        await self._write(self._model_interface.GET_LED_SETTINGS_PACKET)
+        if hasattr(self._model_interface, 'GET_EFFECT_COLOR_SETTINGS_PACKET'):
+            LOGGER.debug(f"Sending GET_EFFECT_COLOR_SETTINGS_PACKET to {self.bluetooth_device_name}")
+            await self._write(self._model_interface.GET_EFFECT_COLOR_SETTINGS_PACKET)
+        else:
+            LOGGER.debug(f"No GET_EFFECT_COLOR_SETTINGS_PACKET for model {self._model_interface.__class__.__name__}")
     
     @property
     def mac(self):
@@ -329,40 +334,106 @@ class LEDNETWFInstance:
 
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
-        LOGGER.debug(f"{self._name}: Ensure connected")
-        if self._connect_lock.locked():
-            LOGGER.debug(f"ES {self._name}: Connection already in progress, waiting for it to complete")
+        import time
+        start_time = time.time()
+        LOGGER.debug(f"{self._name}: Ensure connected started")
         
         if self._client and self._client.is_connected:
+            LOGGER.debug(f"{self._name}: Already connected (check took {time.time() - start_time:.3f}s)")
             self._reset_disconnect_timer()
             return
 
         async with self._connect_lock:
+            lock_acquired_time = time.time()
+            LOGGER.debug(f"{self._name}: Lock acquired after {lock_acquired_time - start_time:.3f}s")
+            
             # Check again while holding the lock
             if self._client and self._client.is_connected:
+                LOGGER.debug(f"{self._name}: Already connected while waiting for lock")
                 self._reset_disconnect_timer()
                 return
             
             LOGGER.debug(f"{self._name}: Not connected yet, connecting now...")
-            client = await establish_connection(
-                BleakClientWithServiceCache,
-                self._bluetooth_device,
-                self.bluetooth_device_name,
-                self._disconnected,
-                use_services_cache=True,
-                ble_device_callback=lambda: self._bluetooth_device,
-            )
             
-            LOGGER.debug(f"{self._name}: Connected")
+            # Refresh the BLE device object to get latest advertisement
+            refresh_start = time.time()
+            fresh_device = bluetooth.async_ble_device_from_address(
+                self._hass, self._mac, connectable=True
+            )
+            refresh_time = time.time() - refresh_start
+            
+            if fresh_device:
+                self._bluetooth_device = fresh_device
+                # Get RSSI from service info instead of BLEDevice
+                service_info = bluetooth.async_last_service_info(self._hass, self._mac)
+                rssi = service_info.rssi if service_info else "unknown"
+                LOGGER.debug(
+                    f"{self._name}: Refreshed device object (RSSI={rssi}) "
+                    f"in {refresh_time:.3f}s"
+                )
+            else:
+                LOGGER.warning(
+                    f"{self._name}: Could not refresh device after {refresh_time:.3f}s, using cached object"
+                )
+            
+            conn_start = time.time()
+            LOGGER.info(f"{self._name}: Starting establish_connection (RSSI={rssi if fresh_device else 'unknown'})...")
+            
+            try:
+                client = await establish_connection(
+                    BleakClientWithServiceCache,
+                    self._bluetooth_device,
+                    self.bluetooth_device_name,
+                    self._disconnected,
+                    use_services_cache=True,
+                    ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+                        self._hass, self._mac, connectable=True
+                    ),
+                )
+                conn_time = time.time() - conn_start
+                LOGGER.info(f"{self._name}: Connection established in {conn_time:.2f}s")
+            except Exception as e:
+                conn_time = time.time() - conn_start
+                LOGGER.error(
+                    f"{self._name}: Connection failed after {conn_time:.2f}s: {e}",
+                    exc_info=True
+                )
+                raise
+            
+            resolve_start = time.time()
             resolved = self._resolve_characteristics(client.services)
             if not resolved:
-                # Try to handle services failing to load
-                resolved = self._resolve_characteristics(await client.get_services())
+                LOGGER.debug(f"{self._name}: First service resolution failed, trying get_services()...")
+                get_services_start = time.time()
+                services = await client.get_services()
+                LOGGER.debug(f"{self._name}: get_services() took {time.time() - get_services_start:.3f}s")
+                resolved = self._resolve_characteristics(services)
+            resolve_time = time.time() - resolve_start
+            LOGGER.debug(f"{self._name}: Characteristics resolved in {resolve_time:.3f}s")
+            
+            if not resolved:
+                LOGGER.error(f"{self._name}: Could not resolve characteristics")
+                await client.disconnect()
+                raise RuntimeError("Could not resolve characteristics")
             
             self._client = client
             self._reset_disconnect_timer()
+            
+            notify_start = time.time()
             LOGGER.debug(f"Trying to start notifications for {self._name}")
             await self._client.start_notify(self._read_uuid, self._notification_handler)
+            notify_time = time.time() - notify_start
+            LOGGER.debug(f"{self._name}: Notifications started in {notify_time:.3f}s")
+            
+            total_time = time.time() - start_time
+            LOGGER.info(
+                f"{self._name}: Total connection sequence: {total_time:.2f}s "
+                f"(lock: {lock_acquired_time - start_time:.2f}s, "
+                f"refresh: {refresh_time:.2f}s, "
+                f"connect: {conn_time:.2f}s, "
+                f"resolve: {resolve_time:.2f}s, "
+                f"notify: {notify_time:.2f}s)"
+            )
             
     def _resolve_characteristics(self, services: BleakGATTServiceCollection) -> bool:
         """Resolve characteristics."""
@@ -389,9 +460,9 @@ class LEDNETWFInstance:
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
         if self._expected_disconnect:
-            LOGGER.debug("Disconnected from device")
+            LOGGER.debug(f"Disconnected from device: {self._name} ({self.mac})")
             return
-        LOGGER.warning("Device unexpectedly disconnected")
+        LOGGER.warning(f"Device unexpectedly disconnected: {self._name} ({self.mac})")
 
     def _disconnect(self) -> None:
         """Disconnect from device."""

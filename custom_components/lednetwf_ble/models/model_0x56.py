@@ -38,14 +38,13 @@ class Model0x56(DefaultModelAbstraction):
         self.supported_color_modes = {ColorMode.HS} # Actually, it supports RGB, but this will allow us to separate colours from brightness
         self.icon = "mdi:led-strip-variant"
         self.effect_list = EFFECT_LIST_0x56
-        # self.fw_major = self.manu_data[0] # XX this should already exist
+        self.bg_color = (0,0,0) # Background colour for effects which support it.  Not currently user settable.
+        # This should cause a notification which describes the current effect including background colour
+        self.GET_EFFECT_COLOR_SETTINGS_PACKET = bytearray.fromhex("00 04 80 00 00 05 06 0a 44 4a 4b 0f e8")
 
         if isinstance(self.manu_data, str):
             self.manu_data = [ord(c) for c in self.manu_data]
-        # LOGGER.debug(f"Manu data: {[hex(x) for x in self.manu_data]}")
-        # LOGGER.debug(f"Manu data 15: {hex(self.manu_data[15])}")
-        # LOGGER.debug(f"Manu data 16: {hex(self.manu_data[16])}")
-
+        
         if self.fw_major == 0x80:
             # TODO: Is this the same packet for 0x56 devices or only 0x80?  Find an 0x56 and test it
             self.INITIAL_PACKET             = bytearray.fromhex("00 01 80 00 00 0c 0d 0b 10 14 19 09 05 0d 2b 38 05 00 0f cf")
@@ -104,6 +103,7 @@ class Model0x56(DefaultModelAbstraction):
         """Set segments in parent instance."""
         if hasattr(self, '_parent_instance'):
             self._parent_instance._segments = value    
+    
     def update_color_state(self, rgb_color):
         hsv_color = super().rgb_to_hsv(rgb_color)
         self.hs_color = tuple(hsv_color[0:2])
@@ -149,6 +149,7 @@ class Model0x56(DefaultModelAbstraction):
         #self.effect     = EFFECT_OFF # The effect is NOT actually off when setting a colour. Static effect 1 is close to effect off, but it's still an effect.
         rgb_color = self.hsv_to_rgb((hs_color[0], hs_color[1], self.brightness))
         LOGGER.debug(f"Setting RGB colour: {rgb_color}")
+        LOGGER.debug(f"Background colour: {self.bg_color}")
         background_col = [0,0,0] # Consider adding support for this in the future?  For now, set black
         rgb_packet = bytearray.fromhex("00 00 80 00 00 0d 0e 0b 41 02 ff 00 00 00 00 00 32 00 00 f0 64")
         rgb_packet[9]  = 0 # Mode "0" leaves the static current mode unchanged.  If we want this to switch the device back to an actual static RGB mode change this to 1.
@@ -156,7 +157,7 @@ class Model0x56(DefaultModelAbstraction):
         # static colours they can change to "Static Mode 1" in the effects.  But perhaps that's not what they would expect to have to do?  It's quite hidden.
         # But they pay off is that they can change the colour of the other static modes as they drag the colour picker around, which is pretty neat. ?
         rgb_packet[10:13] = rgb_color
-        rgb_packet[13:16] = background_col
+        rgb_packet[13:16] = self.bg_color # Background colour, not currently user settable but should be getable from settings
         rgb_packet[16]    = self.effect_speed
         rgb_packet[20]    = sum(rgb_packet[8:19]) & 0xFF # Checksum
         LOGGER.debug(f"Set RGB. RGB {self.get_rgb_color()} Brightness {self.brightness}")
@@ -164,12 +165,11 @@ class Model0x56(DefaultModelAbstraction):
 
     def set_effect(self, effect, brightness):
         # Returns the byte array to set the effect
-        LOGGER.debug(f"Setting effect: {effect}")      
+        LOGGER.debug(f"Setting effect: {effect}")
         if effect not in EFFECT_LIST_0x56:
             raise ValueError(f"Effect '{effect}' not in EFFECTS_LIST_0x53")
         self.effect = effect
         self.brightness = brightness
-        #self.color_mode  = XXX ColorMode.BRIGHTNESS # Don't set this here, we might want to change the color of the effects?
         effect_id = EFFECT_MAP_0x56.get(effect)
         # We might need to force a colour if there isn't one set. The strip lights effects sometimes need a colour to work properly
         # Leaving this off for now, but in the old way we just forced red.
@@ -182,6 +182,7 @@ class Model0x56(DefaultModelAbstraction):
             effect_packet = bytearray.fromhex("00 00 80 00 00 0d 0e 0b 41 02 ff 00 00 00 00 00 32 00 00 f0 64")
             effect_packet[9] = effect_id
             effect_packet[10:13] = self.get_rgb_color()
+            effect_packet[13:16] = self.bg_color # Background colour ?
             effect_packet[16] = self.effect_speed
             effect_packet[20] = sum(effect_packet[8:19]) & 0xFF # checksum
             LOGGER.debug(f"static effect packet : {' '.join([f'{byte:02X}' for byte in effect_packet])}")
@@ -196,7 +197,8 @@ class Model0x56(DefaultModelAbstraction):
             effect_packet[9]     = 1 # On
             effect_packet[11]    = effect_id
             effect_packet[12:15] = self.get_rgb_color()
-            effect_packet[15:18] = self.get_rgb_color() # maybe background colour?
+            # effect_packet[15:18] = self.get_rgb_color() # maybe background colour?
+            effect_packet[15:18] = self.bg_color
             effect_packet[18]    = self.effect_speed # Actually sensitivity, but would like to avoid another slider if possible
             effect_packet[19]    = self.get_brightness_percent()
             effect_packet[20]    = sum(effect_packet[8:19]) & 0xFF
@@ -315,7 +317,7 @@ class Model0x56(DefaultModelAbstraction):
                 selected_effect = payload[4]
                 self.led_count  = payload[12]
                 self.is_on      = True if power == 0x23 else False
-                LOGGER.debug(f"Payload[0]=0x81: Power: {power}, Mode: {mode}, Selected effect: {selected_effect}, LED count: {self.led_count}")
+                LOGGER.debug(f"Payload[0]=0x81: Power: {self.is_on}, Mode: {mode}, Selected effect: {selected_effect}, LED count: {self.led_count}")
 
                 if mode == 0x61:
                     if selected_effect == 0xf0:
@@ -354,7 +356,20 @@ class Model0x56(DefaultModelAbstraction):
                     self.color_mode = ColorMode.BRIGHTNESS
                     self.brightness = int(payload[6] * 255 // 100)
             
-            elif payload[1] == 0x63:
+            if payload[0] == 0x0F:
+                # New settings response packet
+                # My guess is that this is a "0x44" response to a "0x44" request
+                #  N: Response Payload: 0F 44 06 FF FF FF FF FF FF 01 00 00 00 54
+                #                       00 01 02 03 04 05 06 07 08 09 10 11 12 13
+                if payload[1] == 0x44:
+                    current_effect_id = payload[2]
+                    foreground_rgb = (payload[3], payload[4], payload[5])
+                    background_rgb = (payload[6], payload[7], payload[8])
+                    effect_speed   = payload[9]
+                    LOGGER.debug(f"New Settings response received. Current effect id: {current_effect_id}, Foreground RGB: {foreground_rgb}, Background RGB: {background_rgb}, Effect speed: {effect_speed}")
+                    self.bg_color = background_rgb
+
+            if payload[1] == 0x63:
                 LOGGER.debug(f"LED settings response received")
                 self.led_count = int.from_bytes(bytes([payload[2], payload[3]]), byteorder='big') * payload[5]
                 self.segments = payload[5]

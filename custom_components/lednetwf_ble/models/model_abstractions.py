@@ -75,7 +75,14 @@ class DefaultModelAbstraction:
         return self.hsv_to_rgb((self.hs_color[0], self.hs_color[1], self.brightness))
     def turn_on(self):
         self.is_on = True
-        return bytearray.fromhex("00 01 80 00 00 0d 0e 0b 3b 23 00 00 00 00 00 00 00 32 00 00 90")
+        turn_on_packet = bytearray.fromhex("00 01 80 00 00 0d 0e 0b 3b 23 00 00 00 00 00 00 00 32 00 00 90")
+        if hasattr(self, 'bg_color') and self.bg_color:
+            LOGGER.debug(f"Turning on to background colour: {self.bg_color}")
+            turn_on_packet[13:16] = self.bg_color
+        if hasattr(self, 'hs_color') and self.hs_color and self.brightness:
+            rgb_color = self.hsv_to_rgb((self.hs_color[0], self.hs_color[1], self.brightness))
+            turn_on_packet[10:13] = rgb_color
+        return turn_on_packet
     def turn_off(self):
         self.is_on = False
         return bytearray.fromhex("00 01 80 00 00 0d 0e 0b 3b 24 00 00 00 00 00 00 00 32 00 00 91")

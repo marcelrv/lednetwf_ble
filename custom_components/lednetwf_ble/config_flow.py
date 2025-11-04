@@ -166,63 +166,118 @@ class LEDNETWFFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         _LOGGER.debug("[VALIDATE] Entered async_step_validate with input: %s", user_input)
 
         if self._selected is None:
-            _LOGGER.error("[VALIDATE] No device selected at validation step")
-            return self.async_abort(reason="no_selection")
+            _LOGGER.error("[VALIDATE] No device selected")
+            return self.async_abort(reason="no_device_selected")
 
         try:
+            # First time entering this step - connect and flash the device
             if not self._instance:
                 _LOGGER.debug("[VALIDATE] Instantiating device before prompt")
-                data = {
-                    CONF_MAC:   self._selected.address,
-                    CONF_NAME:  self._selected.human_name(),
-                    CONF_DELAY: 120,
-                    CONF_MODEL: self._selected.fw_major,
-                }
-                self._instance = LEDNETWFInstance(self._selected.address, self.hass, data)
-                await self._instance.update()
+                self._instance = LEDNETWFInstance(
+                    self._selected.address,
+                    self.hass,
+                    {
+                        "name": self._selected.display_name(),
+                        CONF_MAC: self._selected.address,
+                        CONF_MODEL: self._selected.fw_major,
+                        CONF_DELAY: 120,
+                    },
+                    {},
+                )
+                _LOGGER.debug("[VALIDATE] Device instantiated, attempting connection...")
+                
+                # Try connecting with timeout
+                try:
+                    await asyncio.wait_for(
+                        self._instance.update(),
+                        timeout=45.0
+                    )
+                    _LOGGER.debug("[VALIDATE] Device connected successfully")
+                except asyncio.TimeoutError:
+                    _LOGGER.error("[VALIDATE] Connection timeout after 45s")
+                    self._instance = None
+                    return self.async_show_form(
+                        step_id="validate",
+                        data_schema=vol.Schema({}),
+                        errors={"base": "timeout"},
+                        description_placeholders={
+                            "device": self._selected.display_name(),
+                            "error": "Connection timeout - device may be out of range"
+                        },
+                    )
+                
                 await self._instance.send_initial_packets()
-                await self._instance._write(self._instance._model_interface.GET_LED_SETTINGS_PACKET)
                 _LOGGER.debug("[VALIDATE] Device instantiated and initial packets sent")
                 _LOGGER.debug("[VALIDATE] Device model interface: %s", self._instance._model_interface)
-                _LOGGER.debug("[VALIDATE] LED Count: %s, Chip Type: %s, Color Order: %s, Segments: %s",
-                              getattr(self._instance._model_interface, 'led_count', 'Unknown'),
-                              getattr(self._instance._model_interface, 'chip_type', 'Unknown'),
-                              getattr(self._instance._model_interface, 'color_order', 'Unknown'),
-                              getattr(self._instance._model_interface, 'segments', 'Unknown'))
 
-            if user_input:
-                if user_input.get("flicker"):
-                    self._abort_if_unique_id_configured()
-                    return self._create_entry()
+                led_count = getattr(self._instance._model_interface, 'led_count', None)
+                chip_type = getattr(self._instance._model_interface, 'chip_type', None)
+                color_order = getattr(self._instance._model_interface, 'color_order', None)
+                segments = getattr(self._instance._model_interface, 'segments', "Unknown")
+                _LOGGER.debug("[VALIDATE] LED Count: %s, Chip Type: %s, Color Order: %s, Segments: %s", 
+                             led_count, chip_type, color_order, segments)
+                
+                await self._instance._write(self._instance._model_interface.GET_LED_SETTINGS_PACKET)
 
-            for _ in range(3):
-                await self._instance.turn_on()
-                await asyncio.sleep(1)
-                await self._instance.turn_off()
-                await asyncio.sleep(1)
+                # NOW flash the device BEFORE asking the user
+                _LOGGER.debug("[VALIDATE] Flashing device to help user identify it")
+                for i in range(3):
+                    _LOGGER.debug(f"[VALIDATE] Flash iteration {i+1}/3")
+                    await self._instance.set_hs_color((0, 100), 255)  # Red
+                    await asyncio.sleep(1)
+                    await self._instance.turn_off()
+                    await asyncio.sleep(1)
+                
+                _LOGGER.debug("[VALIDATE] Flash complete, now showing form to user")
+                
+                # NOW show the form asking if they saw it
+                return self.async_show_form(
+                    step_id="validate",
+                    data_schema=vol.Schema({vol.Required("flicker"): bool}),
+                    description_placeholders={"device": self._selected.display_name()},
+                )
+
+            # User has responded to the form
+            if user_input and user_input.get("flicker"):
+                _LOGGER.debug("[VALIDATE] User confirmed they saw the flicker")
+                
+                led_count = getattr(self._instance._model_interface, 'led_count', None)
+                chip_type = getattr(self._instance._model_interface, 'chip_type', None)
+                color_order = getattr(self._instance._model_interface, 'color_order', None)
+                segments = getattr(self._instance._model_interface, 'segments', "Unknown")
+                _LOGGER.debug("[VALIDATE AFTER CONFIRMATION] LED Count: %s, Chip Type: %s, Color Order: %s, Segments: %s", 
+                             led_count, chip_type, color_order, segments)
+                
+                return self._create_entry()
             
-            _LOGGER.debug("[VALIDATE AFTER FLASH] LED Count: %s, Chip Type: %s, Color Order: %s, Segments: %s",
-                getattr(self._instance._model_interface, 'led_count', 'Unknown'),
-                getattr(self._instance._model_interface, 'chip_type', 'Unknown'),
-                getattr(self._instance._model_interface, 'color_order', 'Unknown'),
-                getattr(self._instance._model_interface, 'segments', 'Unknown'))
+            elif user_input and not user_input.get("flicker"):
+                _LOGGER.debug("[VALIDATE] User said they did NOT see the flicker")
+                # Clean up and abort
+                if self._instance:
+                    await self._instance.stop()
+                    self._instance = None
+                return self.async_abort(reason="device_not_identified")
 
-        except (TimeoutError, BleakNotFoundError) as e:
-            _LOGGER.error("[VALIDATE] Connection failed: %s", e, exc_info=True)
-            return self.async_show_form(
-                step_id="validate",
-                data_schema=vol.Schema({vol.Required("retry"): bool}),
-                errors={"base": "cannot_connect"},
-            )
-
+        except BleakNotFoundError as e:
+            _LOGGER.error("[VALIDATE] Device not found: %s", e)
+            if self._instance:
+                await self._instance.stop()
+                self._instance = None
+            return self.async_abort(reason="no_devices_found")
+        except asyncio.TimeoutError as e:
+            _LOGGER.error("[VALIDATE] Connection timeout: %s", e)
+            if self._instance:
+                await self._instance.stop()
+                self._instance = None
+            return self.async_abort(reason="timeout")
         except Exception as e:
             _LOGGER.error("[VALIDATE] Unexpected error: %s", e, exc_info=True)
-            return self.async_show_form(
-                step_id="validate",
-                data_schema=vol.Schema({vol.Required("retry"): bool}),
-                errors={"base": "unknown"},
-            )
+            if self._instance:
+                await self._instance.stop()
+                self._instance = None
+            return self.async_abort(reason="unknown")
 
+        # Fallback - shouldn't reach here normally
         return self.async_show_form(
             step_id="validate",
             data_schema=vol.Schema({vol.Required("flicker"): bool}),
