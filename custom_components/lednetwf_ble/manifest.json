@@ -4,6 +4,10 @@
 	"bluetooth": [
 		{
 			"local_name": "LEDnetWF*"
+		},
+		
+		{
+			"local_name": "IOTBTEB6*"
 		}
 	],
 	"codeowners": [
